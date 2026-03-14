@@ -1,0 +1,184 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ESPHome – Landis+Gyr T330 / Ultraheat Heat Meter
+#  Board:      ESP32S3
+#  Netzwerk:   WiFi
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  Verzeichnisstruktur (relativ zu /config/esphome/):
+#    t330.yaml
+#    secrets.yaml
+#    components/
+#    └── t330_meter/
+#        ├── __init__.py
+#        └── t330_meter.h
+#
+#  Verkabelung IR-Optikkopf → ESP32S3
+#  ─────────────────────────────────────────────
+#  IR-Kopf TX (vom Zähler) → GPIO3  (Input-only, UART2 RX)
+#  IR-Kopf RX (zum Zähler) → GPIO1   (UART2 TX)
+#  VCC 3,3 V               → 3V3-Pin
+#  GND                     → GND
+#
+
+esphome:
+  name: esphome-web-8dbabc
+  friendly_name: ESP32_T330_heat_meter
+  min_version: 2025.11.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# ── Lokale External Component ─────────────────────────────────────────────────
+external_components:
+  - source:
+      type: local
+      path: components
+
+# ── Wifi ─────────────────────────────────────────────────────────
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - logger.log: "Wifi verbunden - bereit"
+  on_disconnect:
+    - logger.log: "Wifi getrennt"
+
+# ── Logger ────────────────────────────────────────────────────────────────────
+# baud_rate: 115200 → Ausgabe über USB-Serial (immer aktiv, auch ohne Netzwerk)
+# Für detailliertere Ausgaben: level: DEBUG
+logger:
+  level: INFO
+  baud_rate: 115200
+
+
+# ── Home Assistant API ────────────────────────────────────────────────────────
+# Über diese API läuft sowohl die Sensor-Übermittlung als auch der Netzwerk-Log.
+api:
+  encryption:
+    key: !secret esphome_api_key_ESP32_T330_heat_meter
+  # Reboot-Schutz: Gerät startet nicht neu wenn HA kurz nicht erreichbar ist.
+  # Standard wäre 60s – wir erhöhen auf 0 (deaktiviert automatischen Reboot).
+
+# ── Safe Mode deaktivieren ────────────────────────────────────────────────────
+# Safe Mode zählt schnelle Reboots und startet irgendwann in einem
+# eingeschränkten Modus. Da das Gerät nach dem Verbinden stabil läuft,
+# deaktivieren wir es um unnötige Reboots zu verhindern.
+# laut Copilot ist das besser zu lassen
+#safe_mode:
+#  disabled: false
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Onboard-RGB-LED (WS2812 / NeoPixel) am GPIO 38 or 48 or 47
+light:
+  - platform: esp32_rmt_led_strip
+    name: "Onboard RGB"
+    id: onboard_rgb
+    chipset: ws2812
+    pin: GPIO48           
+    num_leds: 1           # Onboard nur 1 NeoPixel
+    rgb_order: GRB        # WS2812 ist i. d. R. GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+# ── T330 Wärmezähler-Komponente ───────────────────────────────────────────────
+t330_meter:
+  id: t330
+  tx_pin: 6
+  rx_pin: 7
+
+  energy_kwh:
+    name: "Wärmeenergie"
+
+  volume_qm:
+    name: "Wasservolumen"
+
+  power_w:
+    name: "Heizleistung"
+
+  volume_flow:
+    name: "Volumenstrom"
+
+  flow_temp:
+    name: "Vorlauftemperatur"
+
+  return_temp:
+    name: "Rücklauftemperatur"
+
+  temp_diff:
+    name: "Temperaturdifferenz"
+
+  operating_time:
+    name: "Betriebszeit"
+
+  activity_duration:
+    name: "Aktivitätsdauer"
+
+  fabrication_number:
+    name: "Fabriknummer"
+
+# In t330.yaml – Abfrageintervall einstellen:
+# (Die Komponente erbt von PollingComponent, update_interval ist in __init__.py definiert)
+  update_interval: 30min    
+
+# ── Diagnose-Sensoren ─────────────────────────────────────────────────────────
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP
+    ssid:
+      name: SSID
+  - platform: version
+    name: Version
+    hide_timestamp: true
+    disabled_by_default: false
+    icon: mdi:new-box
+    entity_category: diagnostic
+
+sensor:
+  - platform: wifi_signal # Reports the WiFi signal strength/RSSI in dB
+    name: "Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+  - platform: copy # Reports the WiFi signal strength in %
+    source_id: wifi_signal_db
+    name: "Signal"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+    device_class: ""
+  - platform: uptime
+    name: Uptime
+    disabled_by_default: false
+    force_update: false
+    unit_of_measurement: s
+    icon: mdi:timer-outline
+    accuracy_decimals: 0
+    device_class: duration
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+
+# ── Buttons ───────────────────────────────────────────────────────────────────
+
+switch:
+  - platform: restart
+    name: Restart
+    icon: mdi:restart
+
+button:
+  - platform: template
+    name: "Wärmezähler ablesen"
+    icon: mdi:meter-electric
+    on_press:
+      - lambda: |-
+          id(t330).update();

@@ -2,8 +2,8 @@
 /**
  * ESPHome External Component: Landis+Gyr T330 / Ultraheat Heat Meter
  * ====================================================================
- * Board:    LilyGo T-Internet-POE V2  (LAN8720A RMII)
- * UART:     UART2, TX=GPIO4, RX=GPIO36  (Ethernet-safe Pins)
+ * Board:    ESP32S3 (WiFi)
+ * UART:     UART2, TX/RX configurable via YAML
  *
  * Protokoll: M-Bus, 4-Sequenz-Handshake
  *   Seq1: Wake-up + Versionsanfrage   (2400 Baud)
@@ -28,6 +28,7 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/network/util.h"
+#include "esphome/components/time/real_time_clock.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <atomic>
 
 namespace esphome {
 namespace t330_meter {
@@ -48,7 +50,7 @@ static const char *const TAG = "t330";
 struct T330Data {
     float energy_kwh          = NAN;
     float volume_qm           = NAN;
-    float power_kw            = NAN;
+    float power_w             = NAN;
     float volume_flow_qm_h    = NAN;
     float flow_temp_c         = NAN;
     float return_temp_c       = NAN;
@@ -59,14 +61,14 @@ struct T330Data {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-class T330Component : public Component {
+class T330Component : public PollingComponent {
  public:
     void set_tx_pin(int p) { tx_pin_ = p; }
     void set_rx_pin(int p) { rx_pin_ = p; }
 
     void set_energy_kwh_sensor(sensor::Sensor *s)           { energy_kwh_sensor_ = s; }
     void set_volume_qm_sensor(sensor::Sensor *s)            { volume_qm_sensor_ = s; }
-    void set_power_kw_sensor(sensor::Sensor *s)             { power_kw_sensor_ = s; }
+    void set_power_w_sensor(sensor::Sensor *s)              { power_w_sensor_ = s; }
     void set_volume_flow_sensor(sensor::Sensor *s)          { volume_flow_sensor_ = s; }
     void set_flow_temp_sensor(sensor::Sensor *s)            { flow_temp_sensor_ = s; }
     void set_return_temp_sensor(sensor::Sensor *s)          { return_temp_sensor_ = s; }
@@ -74,8 +76,17 @@ class T330Component : public Component {
     void set_operating_time_sensor(sensor::Sensor *s)       { operating_time_sensor_ = s; }
     void set_activity_duration_sensor(sensor::Sensor *s)    { activity_duration_sensor_ = s; }
     void set_fabrication_sensor(text_sensor::TextSensor *s) { fabrication_sensor_ = s; }
+    void set_last_read_sensor(text_sensor::TextSensor *s)    { last_read_sensor_ = s; }
+    void set_read_status_sensor(text_sensor::TextSensor *s)  { read_status_sensor_ = s; }
+    void set_time(time::RealTimeClock *t)                    { time_ = t; }
 
     float get_setup_priority() const override { return setup_priority::DATA; }
+
+    void dump_config() override {
+        ESP_LOGCONFIG(TAG, "T330 Heat Meter:");
+        ESP_LOGCONFIG(TAG, "  TX Pin: GPIO%d", tx_pin_);
+        ESP_LOGCONFIG(TAG, "  RX Pin: GPIO%d", rx_pin_);
+    }
 
     void setup() override {
         ESP_LOGI(TAG, "Setup UART2: TX=GPIO%d RX=GPIO%d", tx_pin_, rx_pin_);
@@ -86,12 +97,27 @@ class T330Component : public Component {
         ESP_LOGI(TAG, "FreeRTOS task gestartet auf Core 0");
     }
 
-    void update() {
+    void update() override {
         ESP_LOGI(TAG, "Triggering read cycle");
         xSemaphoreGive(trigger_sem_);
     }
 
     void loop() override {
+        // Status publizieren (nach jedem Leseversuch, auch bei Fehler)
+        if (status_ready_) {
+            std::string st;
+            if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+                st = pending_status_;
+                status_ready_ = false;
+                xSemaphoreGive(data_mutex_);
+            }
+            if (read_status_sensor_ && !st.empty()) {
+                read_status_sensor_->publish_state(st);
+                ESP_LOGI(TAG, "Lesestatus: %s", st.c_str());
+            }
+        }
+
+        // Messdaten publizieren (nur bei Erfolg)
         if (!data_ready_) return;
         T330Data d;
         if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -113,12 +139,14 @@ class T330Component : public Component {
     TaskHandle_t      task_handle_  = nullptr;
     SemaphoreHandle_t trigger_sem_  = nullptr;
     SemaphoreHandle_t data_mutex_   = nullptr;
-    volatile bool     data_ready_   = false;
+    std::atomic<bool> data_ready_{false};
+    std::atomic<bool> status_ready_{false};
     T330Data          pending_data_;
+    std::string       pending_status_;
 
     sensor::Sensor          *energy_kwh_sensor_        = nullptr;
     sensor::Sensor          *volume_qm_sensor_         = nullptr;
-    sensor::Sensor          *power_kw_sensor_          = nullptr;
+    sensor::Sensor          *power_w_sensor_           = nullptr;
     sensor::Sensor          *volume_flow_sensor_       = nullptr;
     sensor::Sensor          *flow_temp_sensor_         = nullptr;
     sensor::Sensor          *return_temp_sensor_       = nullptr;
@@ -126,6 +154,9 @@ class T330Component : public Component {
     sensor::Sensor          *operating_time_sensor_    = nullptr;
     sensor::Sensor          *activity_duration_sensor_ = nullptr;
     text_sensor::TextSensor *fabrication_sensor_       = nullptr;
+    text_sensor::TextSensor *last_read_sensor_          = nullptr;
+    text_sensor::TextSensor *read_status_sensor_        = nullptr;
+    time::RealTimeClock     *time_                      = nullptr;
 
     static void meter_task_(void *param) {
         static_cast<T330Component *>(param)->task_loop_();
@@ -135,6 +166,7 @@ class T330Component : public Component {
         for (;;) {
             xSemaphoreTake(trigger_sem_, portMAX_DELAY);
             if (!network::is_connected()) {
+                set_status_("FEHLER: Netzwerk nicht verbunden");
                 ESP_LOGW(TAG, "Netzwerk nicht verbunden - Abfrage uebersprungen");
                 continue;
             }
@@ -146,10 +178,36 @@ class T330Component : public Component {
                     data_ready_   = true;
                     xSemaphoreGive(data_mutex_);
                 }
+                set_status_("OK");
                 ESP_LOGI(TAG, "Task: read successful");
             } else {
-                ESP_LOGW(TAG, "Task: read failed - retry next interval");
+                set_status_("FEHLER: Ablesung fehlgeschlagen - Retry in 2 min");
+                ESP_LOGW(TAG, "Task: read failed - retry in 120s");
+                vTaskDelay(pdMS_TO_TICKS(120000));
+                // Retry
+                T330Data data2;
+                ESP_LOGI(TAG, "Task: starting retry read");
+                if (read_meter_(data2)) {
+                    if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        pending_data_ = data2;
+                        data_ready_   = true;
+                        xSemaphoreGive(data_mutex_);
+                    }
+                    set_status_("OK (Retry)");
+                    ESP_LOGI(TAG, "Task: retry successful");
+                } else {
+                    set_status_("FEHLER: Ablesung fehlgeschlagen (auch nach Retry)");
+                    ESP_LOGW(TAG, "Task: retry also failed");
+                }
             }
+        }
+    }
+
+    void set_status_(const std::string &status) {
+        if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+            pending_status_ = status;
+            status_ready_ = true;
+            xSemaphoreGive(data_mutex_);
         }
     }
 
@@ -271,6 +329,8 @@ class T330Component : public Component {
         }
 
         // Phase 2: 9600 Baud - Archiv-Frames (stor=1..25) empfangen
+        // Nur Baud-Register umschalten - kein voller UART-Reset!
+        // Der Meter streamt bereits, uart_init_() wuerde Bytes verlieren.
         uart_set_baud_(9600);
         {
             uint8_t chunk[512];
@@ -283,6 +343,7 @@ class T330Component : public Component {
             ESP_LOGI(TAG, "Seq4 - Phase 2: %d Bytes @ 9600 Baud", p2);
         }
 
+        // Zurueck auf 2400 Baud
         uart_set_baud_(2400);
         int total = (int)out.size();
         if (total > 0) {
@@ -315,7 +376,7 @@ class T330Component : public Component {
         while (pos < raw.size()) {
             uint8_t ft = raw[pos++];
             if (ft == 0xE5) continue;
-            if (ft == 0x10) { pos += 3; continue; }
+            if (ft == 0x10) { if (pos + 4 <= raw.size()) pos += 4; else break; continue; }
             if (ft != 0x68) continue;
             if (pos + 3 > raw.size()) break;
             uint8_t l1 = raw[pos], l2 = raw[pos+1]; pos += 3;
@@ -405,7 +466,7 @@ class T330Component : public Component {
 done:       break;
         }
         return !std::isnan(out.energy_kwh)          || !std::isnan(out.volume_qm)        ||
-               !std::isnan(out.power_kw)            || !std::isnan(out.volume_flow_qm_h) ||
+               !std::isnan(out.power_w)             || !std::isnan(out.volume_flow_qm_h) ||
                !std::isnan(out.flow_temp_c)         || !std::isnan(out.return_temp_c)    ||
                !std::isnan(out.temp_diff_k)         || !std::isnan(out.operating_time_h) ||
                !std::isnan(out.activity_duration_s) || !out.fabrication_number.empty();
@@ -422,7 +483,7 @@ done:       break;
         if(v<=0x1F){u="mass_kg";          s=pow(10,(int)(v&7)-3); return;}
         if(v>=0x20&&v<=0x23){static const char*a[]={"on_time_sec","on_time_min","on_time_hours","on_time_days"};u=a[v&3];return;}
         if(v>=0x24&&v<=0x27){static const char*a[]={"operating_time_sec","operating_time_min","operating_time_hours","operating_time_days"};u=a[v&3];return;}
-        if(v<=0x2F){u="power_kw";         s=pow(10,(int)(v&7)-3); return;}
+        if(v<=0x2F){u="power_w";          s=pow(10,(int)(v&7)-3); return;}
         if(v<=0x37){u="power_j_h";        s=pow(10,(int)(v&7));   return;}
         if(v<=0x3F){u="volume_flow_qm_h"; s=pow(10,(int)(v&7)-6); return;}
         if(v<=0x47){u="volume_flow_qm_min";s=pow(10,(int)(v&7)-7);return;}
@@ -454,8 +515,8 @@ done:       break;
             if (std::isnan(out.energy_kwh)) { out.energy_kwh = (float)sv; ESP_LOGI(TAG, "  energy_kwh            = %.3f kWh", sv); return true; }
         } else if (unit == "volume_qm") {
             if (std::isnan(out.volume_qm)) { out.volume_qm = (float)sv; ESP_LOGI(TAG, "  volume_qm             = %.4f m3", sv); return true; }
-        } else if (unit == "power_kw") {
-            if (std::isnan(out.power_kw)) { out.power_kw = (float)sv; ESP_LOGI(TAG, "  power_kw              = %.3f kW", sv); return true; }
+        } else if (unit == "power_w") {
+            if (std::isnan(out.power_w)) { out.power_w = (float)sv; ESP_LOGI(TAG, "  power_w               = %.1f W", sv); return true; }
         } else if (unit == "volume_flow_qm_h") {
             if (std::isnan(out.volume_flow_qm_h)) { out.volume_flow_qm_h = (float)sv; ESP_LOGI(TAG, "  volume_flow_qm_h      = %.4f m3/h", sv); return true; }
         } else if (unit == "flow_temp_c") {
@@ -468,6 +529,10 @@ done:       break;
             if (std::isnan(out.operating_time_h)) { out.operating_time_h = (float)sv; ESP_LOGI(TAG, "  operating_time_hours  = %.0f h", sv); return true; }
         } else if (unit == "operating_time_sec") {
             if (std::isnan(out.operating_time_h)) { out.operating_time_h = (float)(sv/3600.0); ESP_LOGI(TAG, "  operating_time_sec    = %.0f s -> %.2f h", sv, sv/3600.0); return true; }
+        } else if (unit == "operating_time_min") {
+            if (std::isnan(out.operating_time_h)) { out.operating_time_h = (float)(sv/60.0); ESP_LOGI(TAG, "  operating_time_min    = %.0f min -> %.2f h", sv, sv/60.0); return true; }
+        } else if (unit == "operating_time_days") {
+            if (std::isnan(out.operating_time_h)) { out.operating_time_h = (float)(sv*24.0); ESP_LOGI(TAG, "  operating_time_days   = %.0f d -> %.0f h", sv, sv*24.0); return true; }
         } else if (unit == "activity_duration_sec") {
             if (std::isnan(out.activity_duration_s)) { out.activity_duration_s = (float)sv; ESP_LOGI(TAG, "  activity_duration_sec = %.0f s", sv); return true; }
         } else if (unit == "fabrication_number") {
@@ -489,7 +554,7 @@ done:       break;
         else                                   ESP_LOGW(TAG, "  Waermeenergie       : NICHT GEFUNDEN");
         if(!std::isnan(d.volume_qm))           ESP_LOGI(TAG, "  Wasservolumen       : %.4f m3",   d.volume_qm);
         else                                   ESP_LOGW(TAG, "  Wasservolumen       : NICHT GEFUNDEN");
-        if(!std::isnan(d.power_kw))            ESP_LOGI(TAG, "  Heizleistung        : %.4f kW",   d.power_kw);
+        if(!std::isnan(d.power_w))             ESP_LOGI(TAG, "  Heizleistung        : %.1f W",    d.power_w);
         else                                   ESP_LOGW(TAG, "  Heizleistung        : NICHT GEFUNDEN");
         if(!std::isnan(d.volume_flow_qm_h))    ESP_LOGI(TAG, "  Volumenstrom        : %.4f m3/h", d.volume_flow_qm_h);
         else                                   ESP_LOGW(TAG, "  Volumenstrom        : NICHT GEFUNDEN");
@@ -505,7 +570,7 @@ done:       break;
 
         if(energy_kwh_sensor_        &&!std::isnan(d.energy_kwh))          energy_kwh_sensor_->publish_state(d.energy_kwh);
         if(volume_qm_sensor_         &&!std::isnan(d.volume_qm))           volume_qm_sensor_->publish_state(d.volume_qm);
-        if(power_kw_sensor_          &&!std::isnan(d.power_kw))            power_kw_sensor_->publish_state(d.power_kw);
+        if(power_w_sensor_           &&!std::isnan(d.power_w))             power_w_sensor_->publish_state(d.power_w);
         if(volume_flow_sensor_       &&!std::isnan(d.volume_flow_qm_h))    volume_flow_sensor_->publish_state(d.volume_flow_qm_h);
         if(flow_temp_sensor_         &&!std::isnan(d.flow_temp_c))         flow_temp_sensor_->publish_state(d.flow_temp_c);
         if(return_temp_sensor_       &&!std::isnan(d.return_temp_c))       return_temp_sensor_->publish_state(d.return_temp_c);
@@ -513,6 +578,19 @@ done:       break;
         if(operating_time_sensor_    &&!std::isnan(d.operating_time_h))    operating_time_sensor_->publish_state(d.operating_time_h);
         if(activity_duration_sensor_ &&!std::isnan(d.activity_duration_s)) activity_duration_sensor_->publish_state(d.activity_duration_s);
         if(fabrication_sensor_       &&!d.fabrication_number.empty())      fabrication_sensor_->publish_state(d.fabrication_number);
+
+        // Zeitstempel der letzten erfolgreichen Ablesung
+        if (last_read_sensor_ && time_) {
+            auto now = time_->now();
+            if (now.is_valid()) {
+                char buf[25];
+                snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+                         now.year, now.month, now.day_of_month,
+                         now.hour, now.minute, now.second);
+                last_read_sensor_->publish_state(buf);
+                ESP_LOGI(TAG, "  Letzte Ablesung     : %s", buf);
+            }
+        }
     }
 };
 

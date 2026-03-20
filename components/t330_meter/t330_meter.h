@@ -198,11 +198,6 @@ class T330Component : public PollingComponent {
 
                     vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
 
-                    // Voller UART-Hardware-Reset vor Retry:
-                    // Loescht FIFO, Error-Flags, Interrupt-Status - sauberer Neustart
-                    ESP_LOGI(TAG, "Task: UART-Reset vor Retry %d", r + 1);
-                    uart_init_(2400);
-
                     ESP_LOGI(TAG, "Task: starting retry %d/%d", r + 1, max_retries);
                     T330Data retry_data;
                     if (read_meter_(retry_data)) {
@@ -414,16 +409,13 @@ class T330Component : public PollingComponent {
 
     // ── Haupt-Lesefunktion ────────────────────────────────────────────────────
     bool read_meter_(T330Data &out) {
-        uart_set_baud_(2400);
-        uart_flush_();
-
-        // Diagnose: UART-RX-Puffer und Pinstatus pruefen
-        size_t buffered = 0;
-        uart_get_buffered_data_len(T330_UART_PORT, &buffered);
-        if (buffered > 0) {
-            ESP_LOGW(TAG, "UART RX-Puffer nicht leer nach Flush: %d Bytes (werden verworfen)", (int)buffered);
-            uart_flush_input(T330_UART_PORT);
-        }
+        // Voller UART-Hardware-Reset bei jedem Lesevorgang:
+        // Der ESP32-UART-Peripherie akkumuliert ueber Stunden/Tage
+        // interne Zustandsfehler (Error-Flags, FIFO-Drift, Shift-Register),
+        // die die RX-Empfindlichkeit verschlechtern.
+        // uart_init_() loescht alles durch Driver-Delete + Reinstall.
+        // Hier sicher, da der Meter noch nicht sendet.
+        uart_init_(2400);
 
         ESP_LOGI(TAG, "── Starte M-Bus Kommunikation (4 Sequenzen) ──");
         if (!seq1_wakeup_()) { ESP_LOGW(TAG, "Abbruch nach Seq1"); return false; }

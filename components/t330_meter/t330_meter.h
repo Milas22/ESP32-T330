@@ -93,8 +93,13 @@ class T330Component : public PollingComponent {
         trigger_sem_ = xSemaphoreCreateBinary();
         data_mutex_  = xSemaphoreCreateMutex();
         uart_init_(2400);
-        xTaskCreatePinnedToCore(meter_task_, "t330_task", 12288, this, 5, &task_handle_, 0);
-        ESP_LOGI(TAG, "FreeRTOS task gestartet auf Core 0");
+        // Task auf Core 1 (App-Core) starten, nicht Core 0 (WiFi-Core)!
+        // WiFi-Interrupts auf Core 0 unterbrechen den UART-TX-Interrupt-Handler,
+        // was Luecken im IR-Preamble erzeugt und die Aufweckenergie reduziert.
+        // Dieser Effekt verschlechtert sich ueber Stunden, da WiFi-Hintergrund-
+        // aktivitaet (Scanning, mDNS, Beacons) zunimmt.
+        xTaskCreatePinnedToCore(meter_task_, "t330_task", 12288, this, 5, &task_handle_, 1);
+        ESP_LOGI(TAG, "FreeRTOS task gestartet auf Core 1 (App-Core)");
     }
 
     void update() override {
@@ -270,8 +275,8 @@ class T330Component : public PollingComponent {
     //   Versuche 11-15: 960 Null-Bytes (~4.0s IR-Energie)
     //
     // Hintergrund: Der T330 ist batteriebetrieben und hat einen
-    // Kondensator-basierten IR-Aufweckkreis. Bei laengerem Tiefschlaf
-    // oder EMV-Stoerungen (Heizungsbetrieb) braucht er mehr IR-Energie.
+    // Kondensator-basierten IR-Aufweckkreis. Bei 3.3V Versorgung und
+    // 30-min-Intervallen benoetigt er mindestens ~480 Null-Bytes.
     //
     bool seq1_wakeup_() {
         static const uint8_t C[] = {0x68,0x05,0x05,0x68,0x73,0xFE,0x51,0x0F,0x0F,0xE0,0x16};

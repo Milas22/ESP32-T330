@@ -140,6 +140,9 @@ t330_meter:
   activity_duration:
     name: "Aktivitätsdauer"
 
+  seq1_attempts:
+    name: "Aufweckversuche"
+
   fabrication_number:
     name: "Fabriknummer"
 

@@ -13,7 +13,7 @@
  *         Phase 1: 2400 Baud (800 ms)  -> Frame 0: stor=0 Aktualdaten
  *         Phase 2: 9600 Baud           -> Frames 1-27: Archive stor=1..25
  *
- * Architektur: FreeRTOS-Task auf Core 0 - ESPHome-Hauptloop (Core 1) nie blockiert.
+ * Architektur: FreeRTOS-Task auf Core 1 - ESPHome-Hauptloop (Core 1) wird
  *
  * Hintergrund zweiphasige Lektuere:
  *   Der T330 sendet die Aktualdaten (stor=0) bei 2400 Baud, wechselt dann
@@ -57,6 +57,7 @@ struct T330Data {
     float temp_diff_k         = NAN;
     float operating_time_h    = NAN;
     float activity_duration_s = NAN;
+    float seq1_attempts       = NAN;
     std::string fabrication_number;
 };
 
@@ -78,6 +79,7 @@ class T330Component : public PollingComponent {
     void set_fabrication_sensor(text_sensor::TextSensor *s) { fabrication_sensor_ = s; }
     void set_last_read_sensor(text_sensor::TextSensor *s)    { last_read_sensor_ = s; }
     void set_read_status_sensor(text_sensor::TextSensor *s)  { read_status_sensor_ = s; }
+    void set_seq1_attempts_sensor(sensor::Sensor *s)          { seq1_attempts_sensor_ = s; }
     void set_time(time::RealTimeClock *t)                    { time_ = t; }
 
     float get_setup_priority() const override { return setup_priority::DATA; }
@@ -93,8 +95,13 @@ class T330Component : public PollingComponent {
         trigger_sem_ = xSemaphoreCreateBinary();
         data_mutex_  = xSemaphoreCreateMutex();
         uart_init_(2400);
-        xTaskCreatePinnedToCore(meter_task_, "t330_task", 12288, this, 5, &task_handle_, 0);
-        ESP_LOGI(TAG, "FreeRTOS task gestartet auf Core 0");
+        // Task auf Core 1 (App-Core) starten, nicht Core 0 (WiFi-Core)!
+        // WiFi-Interrupts auf Core 0 unterbrechen den UART-TX-Interrupt-Handler,
+        // was Luecken im IR-Preamble erzeugt und die Aufweckenergie reduziert.
+        // Dieser Effekt verschlechtert sich ueber Stunden, da WiFi-Hintergrund-
+        // aktivitaet (Scanning, mDNS, Beacons) zunimmt.
+        xTaskCreatePinnedToCore(meter_task_, "t330_task", 12288, this, 5, &task_handle_, 1);
+        ESP_LOGI(TAG, "FreeRTOS task gestartet auf Core 1 (App-Core)");
     }
 
     void update() override {
@@ -117,7 +124,7 @@ class T330Component : public PollingComponent {
             }
         }
 
-        // Messdaten publizieren (nur bei Erfolg)
+        // Messdaten/Diagnostik publizieren (bei Erfolg alle Werte, bei Totalausfall nur seq1_attempts)
         if (!data_ready_) return;
         T330Data d;
         if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -153,6 +160,7 @@ class T330Component : public PollingComponent {
     sensor::Sensor          *temp_diff_sensor_         = nullptr;
     sensor::Sensor          *operating_time_sensor_    = nullptr;
     sensor::Sensor          *activity_duration_sensor_ = nullptr;
+    sensor::Sensor          *seq1_attempts_sensor_     = nullptr;
     text_sensor::TextSensor *fabrication_sensor_       = nullptr;
     text_sensor::TextSensor *last_read_sensor_          = nullptr;
     text_sensor::TextSensor *read_status_sensor_        = nullptr;
@@ -171,33 +179,77 @@ class T330Component : public PollingComponent {
                 continue;
             }
             ESP_LOGI(TAG, "Task: starting meter read");
+
+            // Kumulative Aufweckversuche ueber alle Zyklen:
+            //   1-15:  Erfolg im 1. Zyklus (Versuchsnummer)
+            //  16-30:  1. Zyklus fehlgeschlagen, Retry 1 erfolgreich
+            //  31-45:  2 Zyklen fehlgeschlagen, Retry 2 erfolgreich
+            //      0:  Totalausfall (alle Zyklen fehlgeschlagen)
+            int total_seq1 = 0;
             T330Data data;
+
             if (read_meter_(data)) {
+                total_seq1 = (int)data.seq1_attempts;
+                data.seq1_attempts = (float)total_seq1;
                 if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
                     pending_data_ = data;
                     data_ready_   = true;
                     xSemaphoreGive(data_mutex_);
                 }
                 set_status_("OK");
-                ESP_LOGI(TAG, "Task: read successful");
+                ESP_LOGI(TAG, "Task: read successful (seq1_total=%d)", total_seq1);
             } else {
-                set_status_("FEHLER: Ablesung fehlgeschlagen - Retry in 2 min");
-                ESP_LOGW(TAG, "Task: read failed - retry in 120s");
-                vTaskDelay(pdMS_TO_TICKS(120000));
-                // Retry
-                T330Data data2;
-                ESP_LOGI(TAG, "Task: starting retry read");
-                if (read_meter_(data2)) {
+                total_seq1 += (int)data.seq1_attempts;
+
+                // Retry-Strategie: bis zu 2 Retries mit UART-Reset
+                //   Retry 1: nach  30s (kurze Pause + UART-Reset)
+                //   Retry 2: nach 120s (laengere Pause fuer tiefen Schlaf)
+                bool retry_ok = false;
+                static const int retry_delays[] = {30, 120}; // Sekunden
+                static const int max_retries = 2;
+
+                for (int r = 0; r < max_retries && !retry_ok; r++) {
+                    int delay_s = retry_delays[r];
+                    ESP_LOGW(TAG, "Task: read failed - Retry %d/%d in %ds (seq1_total=%d)",
+                             r + 1, max_retries, delay_s, total_seq1);
+                    if (r == 0)
+                        set_status_("FEHLER: Ablesung fehlgeschlagen - Retry in 30s");
+                    else
+                        set_status_("FEHLER: Retry 1 fehlgeschlagen - Retry 2 in 120s");
+
+                    vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+
+                    ESP_LOGI(TAG, "Task: starting retry %d/%d", r + 1, max_retries);
+                    T330Data retry_data;
+                    if (read_meter_(retry_data)) {
+                        total_seq1 += (int)retry_data.seq1_attempts;
+                        retry_data.seq1_attempts = (float)total_seq1;
+                        if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            pending_data_ = retry_data;
+                            data_ready_   = true;
+                            xSemaphoreGive(data_mutex_);
+                        }
+                        char msg[48];
+                        snprintf(msg, sizeof(msg), "OK (Retry %d)", r + 1);
+                        set_status_(msg);
+                        ESP_LOGI(TAG, "Task: retry %d successful (seq1_total=%d)", r + 1, total_seq1);
+                        retry_ok = true;
+                    } else {
+                        total_seq1 += (int)retry_data.seq1_attempts;
+                    }
+                }
+
+                if (!retry_ok) {
+                    set_status_("FEHLER: Ablesung fehlgeschlagen (auch nach 2 Retries)");
+                    ESP_LOGW(TAG, "Task: all %d retries failed (seq1_total=%d)", max_retries, total_seq1);
+                    // Totalausfall: nur seq1_attempts=0 publizieren (keine Messdaten)
+                    T330Data fail_data;
+                    fail_data.seq1_attempts = 0.0f;
                     if (xSemaphoreTake(data_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        pending_data_ = data2;
+                        pending_data_ = fail_data;
                         data_ready_   = true;
                         xSemaphoreGive(data_mutex_);
                     }
-                    set_status_("OK (Retry)");
-                    ESP_LOGI(TAG, "Task: retry successful");
-                } else {
-                    set_status_("FEHLER: Ablesung fehlgeschlagen (auch nach Retry)");
-                    ESP_LOGW(TAG, "Task: retry also failed");
                 }
             }
         }
@@ -243,30 +295,65 @@ class T330Component : public PollingComponent {
     }
 
     // ── Sequenz 1: Wake-up + Versionsanfrage ─────────────────────────────────
-    bool seq1_wakeup_() {
+    //
+    // Progressive Preamble-Strategie:
+    //   Versuche  1- 5: 240 Null-Bytes (~1.0s IR-Energie)
+    //   Versuche  6-10: 480 Null-Bytes (~2.0s IR-Energie)
+    //   -- 5 Sekunden Pause (Meter-Aufwachzeit) --
+    //   Versuche 11-15: 960 Null-Bytes (~4.0s IR-Energie)
+    //
+    // Hintergrund: Der T330 ist batteriebetrieben und hat einen
+    // Kondensator-basierten IR-Aufweckkreis. Bei 3.3V Versorgung und
+    // 30-min-Intervallen benoetigt er mindestens ~480 Null-Bytes.
+    //
+    // Gibt die Anzahl der benoetigten Versuche zurueck (0 = fehlgeschlagen)
+    int seq1_wakeup_() {
         static const uint8_t C[] = {0x68,0x05,0x05,0x68,0x73,0xFE,0x51,0x0F,0x0F,0xE0,0x16};
-        auto buf = make_cmd_(C, sizeof(C));
         uint8_t resp[64];
-        for (int i = 1; i <= 10; i++) {
+        const int max_attempts = 15;
+
+        for (int i = 1; i <= max_attempts; i++) {
+            // Progressive preamble: mehr IR-Energie fuer spaetere Versuche
+            size_t pre_len = (i <= 5) ? 240 : (i <= 10) ? 480 : 960;
+            auto buf = make_cmd_(C, sizeof(C), pre_len);
+
+            // Nach 10 fehlgeschlagenen Versuchen: Pause, damit der Meter
+            // die akkumulierte IR-Energie verarbeiten kann
+            if (i == 11) {
+                ESP_LOGI(TAG, "Seq1: 10 Versuche ohne Antwort - 5s Pause, erhoehe Preamble auf 960 Bytes");
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            }
+
             uart_flush_();
             uart_write_(buf.data(), buf.size());
             int n = uart_read_(resp, sizeof(resp), 1500);
-            if (n <= 0) { ESP_LOGI(TAG, "Seq1 #%d/10: keine Antwort (IR-Kopf korrekt aufgesetzt?)", i); continue; }
+
+            if (n <= 0) {
+                ESP_LOGI(TAG, "Seq1 #%d/%d: keine Antwort (preamble=%d)", i, max_attempts, (int)pre_len);
+                continue;
+            }
             if (n >= (int)sizeof(C)) {
                 bool echo = true;
                 for (size_t k = 0; k < sizeof(C) && echo; k++)
                     if (resp[n - sizeof(C) + k] != C[k]) echo = false;
-                if (echo) { ESP_LOGW(TAG, "Seq1 #%d/10: Echo - IR-Kopf falsch platziert!", i); continue; }
+                if (echo) { ESP_LOGW(TAG, "Seq1 #%d/%d: Echo - IR-Kopf falsch platziert!", i, max_attempts); continue; }
             }
             for (int k = 0; k < n - 1; k++) {
                 if (resp[k] == 'N' && resp[k+1] == 'b') {
-                    ESP_LOGI(TAG, "Seq1 OK - Versionsstring empfangen (%d Bytes)", n);
-                    return true;
+                    ESP_LOGI(TAG, "Seq1 OK - Versionsstring empfangen (%d Bytes, Versuch %d, preamble=%d)", n, i, (int)pre_len);
+                    return i;  // Anzahl der benoetigten Versuche
                 }
             }
+            // Bytes empfangen aber kein Versionsstring - Hex-Dump zur Diagnose
+            ESP_LOGW(TAG, "Seq1 #%d/%d: %d Bytes empfangen aber kein Versionsstring", i, max_attempts, n);
+            ESP_LOGW(TAG, "  Hex: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     n > 0 ? resp[0] : 0, n > 1 ? resp[1] : 0,
+                     n > 2 ? resp[2] : 0, n > 3 ? resp[3] : 0,
+                     n > 4 ? resp[4] : 0, n > 5 ? resp[5] : 0,
+                     n > 6 ? resp[6] : 0, n > 7 ? resp[7] : 0);
         }
-        ESP_LOGW(TAG, "Seq1 FEHLGESCHLAGEN");
-        return false;
+        ESP_LOGW(TAG, "Seq1 FEHLGESCHLAGEN nach %d Versuchen", max_attempts);
+        return 0;  // 0 = fehlgeschlagen
     }
 
     // ── Sequenz 2: Application Reset ─────────────────────────────────────────
@@ -356,10 +443,19 @@ class T330Component : public PollingComponent {
 
     // ── Haupt-Lesefunktion ────────────────────────────────────────────────────
     bool read_meter_(T330Data &out) {
-        uart_set_baud_(2400);
-        uart_flush_();
+        // Voller UART-Hardware-Reset bei jedem Lesevorgang:
+        // Der ESP32-UART-Peripherie akkumuliert ueber Stunden/Tage
+        // interne Zustandsfehler (Error-Flags, FIFO-Drift, Shift-Register),
+        // die die RX-Empfindlichkeit verschlechtern.
+        // uart_init_() loescht alles durch Driver-Delete + Reinstall.
+        // Hier sicher, da der Meter noch nicht sendet.
+        uart_init_(2400);
+
         ESP_LOGI(TAG, "── Starte M-Bus Kommunikation (4 Sequenzen) ──");
-        if (!seq1_wakeup_()) { ESP_LOGW(TAG, "Abbruch nach Seq1"); return false; }
+        int seq1_tries = seq1_wakeup_();
+        // Immer speichern: 15 bei Totalausfall von Seq1, sonst tatsaechliche Versuche
+        out.seq1_attempts = (float)(seq1_tries == 0 ? 15 : seq1_tries);
+        if (seq1_tries == 0) { ESP_LOGW(TAG, "Abbruch nach Seq1"); return false; }
         if (!seq2_reset_())  { ESP_LOGW(TAG, "Abbruch nach Seq2"); return false; }
         if (!seq3_select_()) { ESP_LOGW(TAG, "Abbruch nach Seq3"); return false; }
         std::vector<uint8_t> raw;
@@ -548,6 +644,11 @@ done:       break;
 
     // ── Werte an Home Assistant publizieren ───────────────────────────────────
     void publish_(const T330Data &d) {
+        // Pruefe ob echte Messdaten vorhanden (false bei Totalausfall, nur seq1_attempts)
+        bool has_meter_data = !std::isnan(d.energy_kwh) || !std::isnan(d.volume_qm) ||
+                              !std::isnan(d.power_w);
+
+        if (has_meter_data) {
         ESP_LOGI(TAG, "══════════════════════════════════════════");
         ESP_LOGI(TAG, "  Publizierte Werte (stor=0/tar=0):");
         if(!std::isnan(d.energy_kwh))         ESP_LOGI(TAG, "  Waermeenergie       : %.4f kWh",  d.energy_kwh);
@@ -567,6 +668,9 @@ done:       break;
         if(!std::isnan(d.activity_duration_s)) ESP_LOGI(TAG, "  Aktivitaetsdauer    : %.0f s",    d.activity_duration_s);
         if(!d.fabrication_number.empty())      ESP_LOGI(TAG, "  Fabriknummer        : %s",        d.fabrication_number.c_str());
         ESP_LOGI(TAG, "══════════════════════════════════════════");
+        }
+
+        if(!std::isnan(d.seq1_attempts)) ESP_LOGI(TAG, "  Aufweckversuche (kumulativ): %.0f", d.seq1_attempts);
 
         if(energy_kwh_sensor_        &&!std::isnan(d.energy_kwh))          energy_kwh_sensor_->publish_state(d.energy_kwh);
         if(volume_qm_sensor_         &&!std::isnan(d.volume_qm))           volume_qm_sensor_->publish_state(d.volume_qm);
@@ -577,10 +681,11 @@ done:       break;
         if(temp_diff_sensor_         &&!std::isnan(d.temp_diff_k))         temp_diff_sensor_->publish_state(d.temp_diff_k);
         if(operating_time_sensor_    &&!std::isnan(d.operating_time_h))    operating_time_sensor_->publish_state(d.operating_time_h);
         if(activity_duration_sensor_ &&!std::isnan(d.activity_duration_s)) activity_duration_sensor_->publish_state(d.activity_duration_s);
+        if(seq1_attempts_sensor_     &&!std::isnan(d.seq1_attempts))       seq1_attempts_sensor_->publish_state(d.seq1_attempts);
         if(fabrication_sensor_       &&!d.fabrication_number.empty())      fabrication_sensor_->publish_state(d.fabrication_number);
 
-        // Zeitstempel der letzten erfolgreichen Ablesung
-        if (last_read_sensor_ && time_) {
+        // Zeitstempel nur bei erfolgreicher Ablesung (nicht bei Totalausfall)
+        if (has_meter_data && last_read_sensor_ && time_) {
             auto now = time_->now();
             if (now.is_valid()) {
                 char buf[25];
